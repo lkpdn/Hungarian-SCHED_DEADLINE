@@ -658,6 +658,25 @@ struct sched_dl_entity {
 	 */
 	struct sched_dl_entity *pi_se;
 #endif
+
+	raw_spinlock_t			resched_timer_lock;
+	struct hrtimer			resched_timer;
+
+	/* Edge weight from this entity to each cpu in assignment problem */
+	u64				hm_weight[NR_CPUS];
+
+	/* Current vertex index in the assignment problem */
+	int				xi;
+	struct root_domain		*rd;
+
+	/*
+	 * Successful enqueue makes this entity latched and will soon be picked up,
+	 * or pushed away if the assigned cpu is not the rq it was enqueued onto.
+	 */
+	struct list_head		latch_dl_entry;
+	struct rq 			*latch_dl_rq;
+	struct list_head		push_dl_entry;
+	struct rq			*push_dl_rq;
 };
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -1815,6 +1834,7 @@ current_restore_flags(unsigned long orig_flags, unsigned long flags)
 extern int cpuset_cpumask_can_shrink(const struct cpumask *cur, const struct cpumask *trial);
 extern int task_can_attach(struct task_struct *p, const struct cpumask *cs_cpus_allowed);
 #ifdef CONFIG_SMP
+extern int migration_cpu_stop(void *data);
 extern void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask);
 extern int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask);
 extern int dup_user_cpus_ptr(struct task_struct *dst, struct task_struct *src, int node);

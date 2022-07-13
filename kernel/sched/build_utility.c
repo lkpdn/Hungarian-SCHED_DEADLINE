@@ -82,6 +82,7 @@
 #include "swait.c"
 #include "wait_bit.c"
 #include "wait.c"
+#include "hungarian.c"
 
 #ifdef CONFIG_SMP
 # include "cpupri.c"

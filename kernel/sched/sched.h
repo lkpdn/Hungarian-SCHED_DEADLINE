@@ -89,6 +89,7 @@
 
 #include "cpupri.h"
 #include "cpudeadline.h"
+#include "hungarian.h"
 
 #ifdef CONFIG_SCHED_DEBUG
 # define SCHED_WARN_ON(x)      WARN_ONCE(x, #x)
@@ -290,11 +291,6 @@ struct dl_bandwidth {
 	u64			dl_runtime;
 	u64			dl_period;
 };
-
-static inline int dl_bandwidth_enabled(void)
-{
-	return sysctl_sched_rt_runtime >= 0;
-}
 
 /*
  * To keep the bandwidth of -deadline tasks under control
@@ -715,33 +711,8 @@ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
 
 /* Deadline class' related fields in a runqueue */
 struct dl_rq {
-	/* runqueue is an rbtree, ordered by deadline */
-	struct rb_root_cached	root;
-
-	unsigned int		dl_nr_running;
-
-#ifdef CONFIG_SMP
-	/*
-	 * Deadline values of the currently executing and the
-	 * earliest ready task on this rq. Caching these facilitates
-	 * the decision whether or not a ready but not running task
-	 * should migrate somewhere else.
-	 */
-	struct {
-		u64		curr;
-		u64		next;
-	} earliest_dl;
-
-	unsigned int		dl_nr_migratory;
-	int			overloaded;
-
-	/*
-	 * Tasks on this rq that can be pushed away. They are kept in
-	 * an rb-tree, ordered by tasks' deadlines, with caching
-	 * of the leftmost (earliest deadline) element.
-	 */
-	struct rb_root_cached	pushable_dl_tasks_root;
-#else
+	atomic_t		dl_nr_runnable;
+#ifndef CONFIG_SMP
 	struct dl_bw		dl_bw;
 #endif
 	/*
@@ -768,6 +739,12 @@ struct dl_rq {
 	 * by the GRUB algorithm.
 	 */
 	u64			bw_ratio;
+
+	/* Current vertex index in the bipartite graph for the assignment problem */
+	int			yi;
+	struct list_head	push_dl;
+	struct list_head	latch_dl;
+	struct task_struct	*latched;
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -800,6 +777,24 @@ static inline long se_runnable(struct sched_entity *se)
 #endif
 
 #ifdef CONFIG_SMP
+struct migration_arg {
+	struct task_struct              *task;
+	int                             dest_cpu;
+	struct set_affinity_pending     *pending;
+};
+
+/*
+ * @refs: number of wait_for_completion()
+ * @stop_pending: is @stop_work in use
+ */
+struct set_affinity_pending {
+	refcount_t              refs;
+	unsigned int            stop_pending;
+	struct completion       done;
+	struct cpu_stop_work    stop_work;
+	struct migration_arg    arg;
+};
+
 /*
  * XXX we want to get rid of these helpers and use the full load resolution.
  */
@@ -857,6 +852,7 @@ struct root_domain {
 	atomic_t		dlo_count;
 	struct dl_bw		dl_bw;
 	struct cpudl		cpudl;
+	struct hm_graph		*dl_hg;
 
 	/*
 	 * Indicate whether a root_domain's dl_bw has been checked or
@@ -2124,6 +2120,7 @@ extern const u32		sched_prio_to_wmult[40];
 #define DEQUEUE_SAVE		0x02 /* Matches ENQUEUE_RESTORE */
 #define DEQUEUE_MOVE		0x04 /* Matches ENQUEUE_MOVE */
 #define DEQUEUE_NOCLOCK		0x08 /* Matches ENQUEUE_NOCLOCK */
+#define DEQUEUE_KEEP_CPU	0x80
 
 #define ENQUEUE_WAKEUP		0x01
 #define ENQUEUE_RESTORE		0x02
@@ -2137,6 +2134,7 @@ extern const u32		sched_prio_to_wmult[40];
 #else
 #define ENQUEUE_MIGRATED	0x00
 #endif
+#define ENQUEUE_KEEP_CPU	0x80
 
 #define RETRY_TASK		((void *)-1UL)
 
@@ -2255,11 +2253,6 @@ static inline bool sched_stop_runnable(struct rq *rq)
 	return rq->stop && task_on_rq_queued(rq->stop);
 }
 
-static inline bool sched_dl_runnable(struct rq *rq)
-{
-	return rq->dl.dl_nr_running > 0;
-}
-
 static inline bool sched_rt_runnable(struct rq *rq)
 {
 	return rq->rt.rt_queued > 0;
@@ -2356,6 +2349,7 @@ extern bool sched_rt_bandwidth_account(struct rt_rq *rt_rq);
 extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
 extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
 extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
+extern void init_dl_resched_task_timer(struct sched_dl_entity *dl_se);
 
 #define BW_SHIFT		20
 #define BW_UNIT			(1 << BW_SHIFT)

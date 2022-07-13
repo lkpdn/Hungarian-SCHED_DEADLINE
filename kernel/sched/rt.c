@@ -1709,7 +1709,7 @@ static int balance_rt(struct rq *rq, struct task_struct *p, struct rq_flags *rf)
 		rq_repin_lock(rq, rf);
 	}
 
-	return sched_stop_runnable(rq) || sched_dl_runnable(rq) || sched_rt_runnable(rq);
+	return sched_stop_runnable(rq) || sched_rt_runnable(rq);
 }
 #endif /* CONFIG_SMP */
 

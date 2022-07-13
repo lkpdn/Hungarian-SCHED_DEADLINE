@@ -556,6 +556,10 @@ static int init_rootdomain(struct root_domain *rd)
 
 	if (cpupri_init(&rd->cpupri) != 0)
 		goto free_cpudl;
+
+	rd->dl_hg = hm_init();
+	if (!rd->dl_hg)
+		goto free_cpudl;
 	return 0;
 
 free_cpudl:

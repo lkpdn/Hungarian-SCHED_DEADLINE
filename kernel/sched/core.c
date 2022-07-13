@@ -1183,7 +1183,7 @@ bool sched_can_stop_tick(struct rq *rq)
 	int fifo_nr_running;
 
 	/* Deadline tasks, even if single, need the tick */
-	if (rq->dl.dl_nr_running)
+	if (atomic_read(&rq->dl.dl_nr_runnable))
 		return false;
 
 	/*
@@ -2335,24 +2335,6 @@ static struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 	return rq;
 }
 
-struct migration_arg {
-	struct task_struct		*task;
-	int				dest_cpu;
-	struct set_affinity_pending	*pending;
-};
-
-/*
- * @refs: number of wait_for_completion()
- * @stop_pending: is @stop_work in use
- */
-struct set_affinity_pending {
-	refcount_t		refs;
-	unsigned int		stop_pending;
-	struct completion	done;
-	struct cpu_stop_work	stop_work;
-	struct migration_arg	arg;
-};
-
 /*
  * Move (not current) task off this CPU, onto the destination CPU. We're doing
  * this because either it can't run here any more (set_cpus_allowed()
@@ -2380,7 +2362,7 @@ static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
  * and performs thread migration by bumping thread off CPU then
  * 'pushing' onto another runqueue.
  */
-static int migration_cpu_stop(void *data)
+int migration_cpu_stop(void *data)
 {
 	struct migration_arg *arg = data;
 	struct set_affinity_pending *pending = arg->pending;
@@ -2970,16 +2952,6 @@ static int restrict_cpus_allowed_ptr(struct task_struct *p,
 	}
 
 	rq = task_rq_lock(p, &rf);
-
-	/*
-	 * Forcefully restricting the affinity of a deadline task is
-	 * likely to cause problems, so fail and noisily override the
-	 * mask entirely.
-	 */
-	if (task_has_dl_policy(p) && dl_bandwidth_enabled()) {
-		err = -EPERM;
-		goto err_unlock;
-	}
 
 	if (!cpumask_and(new_mask, &p->cpus_mask, subset_mask)) {
 		err = -EINVAL;
@@ -4314,7 +4286,15 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	RB_CLEAR_NODE(&p->dl.rb_node);
 	init_dl_task_timer(&p->dl);
 	init_dl_inactive_task_timer(&p->dl);
+	init_dl_resched_task_timer(&p->dl);
 	__dl_clear_params(p);
+	p->dl.xi = -1;
+	p->dl.rd = NULL;
+	memset(&p->dl.hm_weight, 0, sizeof(p->dl.hm_weight));
+	INIT_LIST_HEAD(&p->dl.push_dl_entry);
+	INIT_LIST_HEAD(&p->dl.latch_dl_entry);
+	p->dl.push_dl_rq = NULL;
+	p->dl.latch_dl_rq = NULL;
 
 	INIT_LIST_HEAD(&p->rt.run_list);
 	p->rt.timeout		= 0;
@@ -5733,7 +5713,8 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 * opportunity to pull in more work from other CPUs.
 	 */
 	if (likely(!sched_class_above(prev->sched_class, &fair_sched_class) &&
-		   rq->nr_running == rq->cfs.h_nr_running)) {
+		   rq->nr_running == rq->cfs.h_nr_running &&
+		   atomic_read(&rq->dl.dl_nr_runnable) == 0)) {
 
 		p = pick_next_task_fair(rq, prev, rf);
 		if (unlikely(p == RETRY_TASK))
@@ -7449,17 +7430,13 @@ change:
 		}
 #endif
 #ifdef CONFIG_SMP
-		if (dl_bandwidth_enabled() && dl_policy(policy) &&
-				!(attr->sched_flags & SCHED_FLAG_SUGOV)) {
-			cpumask_t *span = rq->rd->span;
-
+		if (dl_policy(policy) && !(attr->sched_flags & SCHED_FLAG_SUGOV)) {
 			/*
-			 * Don't allow tasks with an affinity mask smaller than
-			 * the entire root_domain to become SCHED_DEADLINE. We
-			 * will also fail if there's no bandwidth available.
+			 * What's unacceptable is to have the affinity mask span
+			 * multiple root domains. Still, fail if there's no bandwidth
+			 * available.
 			 */
-			if (!cpumask_subset(span, p->cpus_ptr) ||
-			    rq->rd->dl_bw.bw == 0) {
+			if (rq->rd->dl_bw.bw == 0) {
 				retval = -EPERM;
 				goto unlock;
 			}
@@ -7985,23 +7962,24 @@ out_unlock:
 #ifdef CONFIG_SMP
 int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 {
-	int ret = 0;
+	int cpu, ret = 0;
 
 	/*
-	 * If the task isn't a deadline task or admission control is
-	 * disabled then we don't care about affinity changes.
+	 * If the task isn't a deadline task, we don't care about affinity changes.
 	 */
-	if (!task_has_dl_policy(p) || !dl_bandwidth_enabled())
+	if (!task_has_dl_policy(p))
 		return 0;
 
 	/*
-	 * Since bandwidth control happens on root_domain basis,
-	 * if admission test is enabled, we only admit -deadline
-	 * tasks allowed to run on all the CPUs in the task's
+	 * Since tasks to processors matching happens on root_domain basis, we only
+	 * admit -deadline tasks allowed to run only on the CPUs in the task's
 	 * root_domain.
 	 */
 	rcu_read_lock();
-	if (!cpumask_subset(task_rq(p)->rd->span, mask))
+	cpu = cpumask_first(mask);
+	if (cpu >= nr_cpu_ids)
+		ret = -EINVAL;
+	else if (!cpumask_subset(mask, cpu_rq(cpu)->rd->span))
 		ret = -EBUSY;
 	rcu_read_unlock();
 	return ret;
